@@ -16,16 +16,20 @@ station_order:
 
 history: 15
 horizon: 1
-hidden: 64
-epochs: 30
-batch: 64
+hidden: 128
+epochs: 50
+batch: 32
 num_workers: 6
 pin_memory: true
 persistent_workers: true
-lr: 0.001
-lambda_phy: 0.5
+lr: 0.0005
+weight_decay: 0.01
+warmup_epochs: 5
+grad_clip: 1.0
+lambda_phy: 0.3
 dt: 1.0
-pretrain_epochs: 10
+pretrain_epochs: 5
+use_per_node_lstm: true
 station_top_k: 3
 variable_top_k: 9
 

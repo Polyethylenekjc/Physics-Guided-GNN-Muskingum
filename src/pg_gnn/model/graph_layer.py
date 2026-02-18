@@ -8,7 +8,7 @@ from .routing import MuskingumRouting
 
 class GraphRoutingLayer(nn.Module):
     def __init__(
-        self, dim: int, routing: MuskingumRouting, use_dual_channel: bool = True
+        self, dim: int, routing: MuskingumRouting, use_dual_channel: bool = True, dropout: float = 0.1
     ) -> None:
         super().__init__()
         self.use_dual_channel = use_dual_channel
@@ -21,8 +21,17 @@ class GraphRoutingLayer(nn.Module):
         if use_dual_channel:
             self.channel_fusion = nn.Parameter(torch.tensor(0.5))
         
-        self.norm = nn.LayerNorm(dim)
-        self.act = nn.ReLU()
+        # 增加 MLP 用于消息聚合后变换
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim),
+            nn.Dropout(dropout),
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         src, dst = edge_index
@@ -52,5 +61,7 @@ class GraphRoutingLayer(nn.Module):
         out = torch.zeros_like(x)
         out.index_add_(0, dst, messages)
 
-        out = self.norm(self.act(out) + x)
+        # Pre-LN 残差连接
+        out = self.norm1(self.act(out) + x)
+        out = self.norm2(self.mlp(out) + out)
         return out

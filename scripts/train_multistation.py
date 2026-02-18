@@ -333,17 +333,50 @@ def main() -> None:
         hidden_dim=cfg["hidden"],
         horizon=cfg["horizon"],
         edge_index=edge_index.to(device),
+        num_nodes=len(station_order),
         dt=cfg["dt"],
         top_k=cfg["station_top_k"],
         causal_mask=upstream_mask.to(device),
         causal_matrix=None,
         causal_alpha=cfg["causal_alpha"],
+        use_per_node_lstm=cfg.get("use_per_node_lstm", True),
     ).to(device)
 
     loss_fn = PhysicsGuidedLoss(model.routing, lambda_phy=cfg["lambda_phy"])
     data_loss_fn = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg["lr"],
+        weight_decay=cfg.get("weight_decay", 1e-4),
+    )
 
+    # 分站点 LSTM 预训练：为每个站点单独创建一个优化器
+    per_node_optimizers = None
+    if cfg.get("use_per_node_lstm", True):
+        encoder = model.encoder
+        per_node_optimizers = []
+        for node_idx in range(len(station_order)):
+            params = list(encoder.lstms[node_idx].parameters()) + list(
+                encoder.heads[node_idx].parameters()
+            )
+            per_node_optimizers.append(
+                torch.optim.AdamW(
+                    params,
+                    lr=cfg["lr"],
+                    weight_decay=cfg.get("weight_decay", 1e-4),
+                )
+            )
+
+    # 学习率调度器：带 warmup 的余弦退火
+    warmup_epochs = cfg.get("warmup_epochs", 3)
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, cfg["epochs"] - warmup_epochs)
+        return 0.5 * (1.0 + __import__("math").cos(__import__("math").pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    grad_clip = cfg.get("grad_clip", 1.0)
     pretrain_epochs = cfg.get("pretrain_epochs", 0)
 
     checkpoint_path = os.path.join(output_dir, cfg["checkpoint_path"])
@@ -386,15 +419,17 @@ def main() -> None:
         for epoch in range(start_epoch, cfg["epochs"] + 1):
             is_pretrain = epoch <= pretrain_epochs
 
-            # 阶段一：仅预训练节点 LSTM（以及跨站注意力和输出头），冻结路由/图层参数
+            # 阶段一：分站独立预训练 LSTM，冻结路由/图层参数
             if is_pretrain:
                 model.routing.requires_grad_(False)
                 for layer in model.graph_layers:
                     layer.requires_grad_(False)
+                model.head.requires_grad_(False)  # 预训练时使用各站独立的头
             else:
                 model.routing.requires_grad_(True)
                 for layer in model.graph_layers:
                     layer.requires_grad_(True)
+                model.head.requires_grad_(True)
 
             epoch_loss = 0.0
             batch_task = train_progress.add_task(
@@ -406,15 +441,28 @@ def main() -> None:
             )
             last_data_loss = 0.0
             last_phy_loss = 0.0
+            # 仅在预训练阶段统计每个站点的 LSTM loss
+            if is_pretrain:
+                per_station_loss_sum = torch.zeros(len(station_order), device=device)
+                per_station_loss_count = 0
             for batch_idx, (x, y, prev_y) in enumerate(loader, start=1):
                 x = x.to(device)
                 y = y.to(device)
                 prev_y = prev_y.to(device)
 
-                pred = model(x)
+                pred = model(x, pretrain_mode=is_pretrain)
                 if is_pretrain:
-                    # 仅使用数据误差预训练时序编码器
-                    loss = data_loss_fn(pred, y)
+                    # 分站独立预训练：每个站点的 LSTM 独立预测自己的径流
+                    # pred shape: (batch, num_nodes, 1), y shape: (batch, num_nodes, horizon)
+                    # 逐站点 MSE: 先对 batch 和时间（这里为 1）维求平均，保留站点维度
+                    diff = pred - y[:, :, :1]
+                    per_station_batch_loss = (diff ** 2).mean(dim=(0, 2))  # (num_nodes,)
+                    # 累加到 epoch 级别
+                    per_station_loss_sum += per_station_batch_loss
+                    per_station_loss_count += 1
+
+                    # 总的 data loss 仍然是所有站点的平均，便于与后续阶段对齐
+                    loss = per_station_batch_loss.mean()
                     data_part = loss
                     phy_part = torch.zeros(1, device=device)
                 else:
@@ -422,9 +470,22 @@ def main() -> None:
                     data_part = parts["data"]
                     phy_part = parts["physics"]
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                # 预训练阶段：使用每站点独立优化器，仅更新各自的 LSTM + head
+                if is_pretrain and per_node_optimizers is not None:
+                    # 先清零所有编码器参数的梯度
+                    model.encoder.zero_grad()
+                    loss.backward()
+                    # 只对编码器参数做梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(model.encoder.parameters(), grad_clip)
+                    # 为每个站点分别执行一步优化
+                    for opt in per_node_optimizers:
+                        opt.step()
+                else:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    # 梯度裁剪防止梯度爆炸
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
 
                 epoch_loss += loss.item()
                 last_data_loss = data_part.item()
@@ -438,10 +499,22 @@ def main() -> None:
                 )
 
             avg_loss = epoch_loss / len(loader)
-            console.print(
-                f"Epoch {epoch:03d} | loss={avg_loss:.4f} | "
-                f"data={last_data_loss:.4f} | physics={last_phy_loss:.4f}"
-            )
+
+            # 如果是预训练阶段，输出各站点的平均 LSTM loss
+            if is_pretrain and per_station_loss_count > 0:
+                per_station_avg = (per_station_loss_sum / per_station_loss_count).detach().cpu().tolist()
+                station_loss_str = ", ".join(
+                    f"{name}={loss:.4f}" for name, loss in zip(station_order, per_station_avg)
+                )
+                console.print(
+                    f"Epoch {epoch:03d} [预训练] | loss={avg_loss:.4f} | data={last_data_loss:.4f} | "
+                    f"per-station LSTM loss: {station_loss_str}"
+                )
+            else:
+                console.print(
+                    f"Epoch {epoch:03d} | loss={avg_loss:.4f} | "
+                    f"data={last_data_loss:.4f} | physics={last_phy_loss:.4f}"
+                )
             train_progress.update(
                 train_task,
                 completed=epoch,
@@ -450,6 +523,10 @@ def main() -> None:
                 physics=last_phy_loss,
             )
             train_progress.remove_task(batch_task)
+
+            # 更新学习率：只在联合训练阶段调用，且在 optimizer.step 之后
+            if not is_pretrain:
+                scheduler.step()
 
             if epoch % cfg["save_checkpoint_every"] == 0:
                 torch.save(
