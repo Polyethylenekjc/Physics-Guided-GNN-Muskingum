@@ -1,0 +1,35 @@
+data_root: Data/Processed
+output_dir: output
+use_causal_cache: true
+resume: true
+checkpoint_path: checkpoint.pt
+save_checkpoint_every: 1
+
+station_order:
+  - Wudongde Ruku River
+  - Pudu River
+  - Heishui River
+  - Niulan River
+  - Meigu River
+  - Xining River
+  - Zhongdu River
+
+history: 15
+horizon: 1
+hidden: 64
+epochs: 30
+batch: 64
+num_workers: 6
+pin_memory: true
+persistent_workers: true
+lr: 0.001
+lambda_phy: 0.5
+dt: 1.0
+pretrain_epochs: 10
+station_top_k: 3
+variable_top_k: 9
+
+causal_lag: 3
+spearman_max_decay: 0.1
+causal_alpha: 1.0
+save_selection_every: 1
