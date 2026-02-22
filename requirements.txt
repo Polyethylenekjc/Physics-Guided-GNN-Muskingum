@@ -1,5 +1,9 @@
 numpy
+pandas
 scipy
 pyyaml
 rich
 torch
+matplotlib
+scikit-learn
+tqdm
